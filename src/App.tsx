@@ -62,7 +62,18 @@ function App() {
     return id ? new Peer(id, options) : new Peer(options)
   }
   function roster() { return [...usersRef.current.values()] }
-  function broadcast(packet: Packet) { connectionsRef.current.forEach(connection => connection.open && connection.send(packet)) }
+  function safeSend(connection: DataConnection | null | undefined, packet: Packet) {
+    if (!connection?.open) return false
+    try { connection.send(packet); return true } catch { return false }
+  }
+  function broadcast(packet: Packet) { connectionsRef.current.forEach(connection => safeSend(connection, packet)) }
+  function sendToHost(packet: Packet) {
+    if (!safeSend(hostConnectionRef.current, packet)) {
+      setMessage('与房主的连接尚未准备好，请稍后再试。')
+      return false
+    }
+    return true
+  }
   function publishRoster() {
     const packet: Packet = { type: 'roster', users: roster() }
     packet.users.filter(user => !user.sharing && user.id !== myIdRef.current).forEach(user => removeRemoteStream(user.id))
@@ -91,29 +102,33 @@ function App() {
     connection.on('error', () => connection.close())
   }
   function handleHostPacket(peerId: string, packet: Packet) {
-    if (packet.type === 'join') { usersRef.current.set(peerId, { id: peerId, name: packet.name.slice(0, 24) || '匿名用户', sharing: false }); publishRoster(); return }
+    if (packet.type === 'join') {
+      usersRef.current.set(peerId, { id: peerId, name: packet.name.slice(0, 24) || '匿名用户', sharing: false })
+      publishRoster()
+      // 已在共享的房主主动将现有流推送给刚加入的成员。
+      if (streamRef.current) peerRef.current?.call(peerId, streamRef.current)
+      return
+    }
     if (packet.type === 'chat') { broadcast(packet); addChat({ ...packet, mine: false }); return }
     if (packet.type === 'sharing') {
       const user = usersRef.current.get(peerId)
-      if (user) { user.sharing = packet.sharing; usersRef.current.set(peerId, user); publishRoster(); if (packet.sharing) requestStream(peerId) }
+      if (user) { user.sharing = packet.sharing; usersRef.current.set(peerId, user); publishRoster() }
     }
   }
   function handleGuestPacket(packet: Packet) {
     if (packet.type === 'roster') {
+      const previousUsers = usersRef.current
       usersRef.current = new Map(packet.users.map(user => [user.id, user])); setUsers(packet.users)
       packet.users.filter(user => !user.sharing && user.id !== myIdRef.current).forEach(user => removeRemoteStream(user.id))
-      packet.users.filter(user => user.sharing && user.id !== myIdRef.current).forEach(user => requestStream(user.id))
+      // 已在共享的普通成员也主动向新加入者推送流，避免后来者反向拉流失败。
+      if (streamRef.current) {
+        packet.users.filter(user => user.id !== myIdRef.current && !previousUsers.has(user.id))
+          .forEach(user => peerRef.current?.call(user.id, streamRef.current!))
+      }
     }
     if (packet.type === 'chat') addChat({ ...packet, mine: packet.id === myIdRef.current })
   }
   function addChat(item: ChatItem) { setChat(previous => [...previous, item]) }
-  function requestStream(ownerId: string) {
-    if (!peerRef.current || incomingCallsRef.current.has(ownerId) || ownerId === myIdRef.current) return
-    const call = peerRef.current.call(ownerId, new MediaStream()); incomingCallsRef.current.set(ownerId, call)
-    call.on('stream', stream => setRemoteStreams(previous => new Map(previous).set(ownerId, stream)))
-    call.on('close', () => removeRemoteStream(ownerId)); call.on('error', () => removeRemoteStream(ownerId))
-  }
-
   function createRoom() {
     reset(); const newRoom = makeRoomId(); const name = nickname.trim() || makeName()
     setNickname(name); nicknameRef.current = name; setRoomId(newRoom); setMode('host'); setStatus('正在连接…')
@@ -128,7 +143,7 @@ function App() {
     const peer = buildPeer(); peerRef.current = peer; configurePeer(peer)
     peer.on('open', id => {
       myIdRef.current = id; setLocalUser(id); const connection = peer.connect(hostPeerId(safeId), { reliable: true }); hostConnectionRef.current = connection
-      connection.on('open', () => { connection.send({ type: 'join', name } satisfies Packet); setStatus('已连接'); setMessage('已加入房间。') })
+      connection.on('open', () => { safeSend(connection, { type: 'join', name } satisfies Packet); setStatus('已连接'); setMessage('已加入房间。') })
       connection.on('data', data => handleGuestPacket(data as Packet))
       connection.on('close', () => { setStatus('连接失败'); setMessage('房主已结束房间或网络已断开。') })
       connection.on('error', () => { setStatus('连接失败'); setMessage('无法加入该房间，请检查房间号。') })
@@ -137,13 +152,14 @@ function App() {
 
   async function toggleShare() {
     if (sharing) { endShare(); return }
+    if (status !== '已连接' || !myIdRef.current) { setMessage('正在连接房间，请连接成功后再共享。'); return }
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
       streamRef.current = stream; setSharing(true); if (localVideo.current) localVideo.current.srcObject = stream
       stream.getVideoTracks()[0]?.addEventListener('ended', endShare)
       const myId = myIdRef.current; const local = usersRef.current.get(myId)
       if (local) { local.sharing = true; usersRef.current.set(myId, local) }
-      if (mode === 'host') publishRoster(); else hostConnectionRef.current?.send({ type: 'sharing', userId: myId, sharing: true } satisfies Packet)
+      if (mode === 'host') publishRoster(); else sendToHost({ type: 'sharing', userId: myId, sharing: true })
       roster().filter(user => user.id !== myId).forEach(user => peerRef.current?.call(user.id, stream))
     } catch { setMessage('未获得屏幕共享权限。') }
   }
@@ -151,12 +167,13 @@ function App() {
     streamRef.current?.getTracks().forEach(track => track.stop()); streamRef.current = null; setSharing(false); if (localVideo.current) localVideo.current.srcObject = null
     const myId = myIdRef.current; const local = usersRef.current.get(myId)
     if (local) { local.sharing = false; usersRef.current.set(myId, local) }
-    if (mode === 'host') publishRoster(); else hostConnectionRef.current?.send({ type: 'sharing', userId: myId, sharing: false } satisfies Packet)
+    if (mode === 'host') publishRoster(); else sendToHost({ type: 'sharing', userId: myId, sharing: false })
   }
   function sendChat(event: FormEvent) {
     event.preventDefault(); const text = draft.trim(); if (!text || !myIdRef.current) return
+    if (status !== '已连接') { setMessage('正在连接房间，请稍后发送消息。'); return }
     const packet: Packet = { type: 'chat', id: myIdRef.current, name: nicknameRef.current, text: text.slice(0, 500) }
-    if (mode === 'host') { broadcast(packet); addChat({ ...packet, mine: true }) } else hostConnectionRef.current?.send(packet)
+    if (mode === 'host') { broadcast(packet); addChat({ ...packet, mine: true }) } else sendToHost(packet)
     setDraft('')
   }
   async function copyRoom() { await navigator.clipboard.writeText(roomId); setMessage('房间号已复制。') }
@@ -175,8 +192,13 @@ function App() {
 
 function VideoTile({ card, user, fullscreen }: { card: { id: string; stream: MediaStream; mine: boolean }; user?: RoomUser; fullscreen: (video: HTMLVideoElement | null) => void }) {
   const ref = useRef<HTMLVideoElement>(null)
+  const [volume, setVolume] = useState(100)
   useEffect(() => { if (ref.current) ref.current.srcObject = card.stream }, [card.stream])
-  return <article className="video-tile"><video ref={ref} autoPlay playsInline muted={card.mine} /><div className="video-bar"><span>{card.mine ? '我的屏幕' : user?.name || '用户屏幕'}</span><button onClick={() => fullscreen(ref.current)}>全屏</button></div></article>
+  function changeVolume(value: number) {
+    setVolume(value)
+    if (ref.current) ref.current.volume = value / 100
+  }
+  return <article className="video-tile"><video ref={ref} autoPlay playsInline muted={card.mine} /><div className="video-bar"><span>{card.mine ? '我的屏幕（本地静音）' : user?.name || '用户屏幕'}</span><div className="video-actions">{!card.mine && <label className="volume" title={`音量 ${volume}%`}><span>🔊</span><input aria-label={`${user?.name || '视频'}音量`} type="range" min="0" max="100" value={volume} onChange={event => changeVolume(Number(event.target.value))} /></label>}<button onClick={() => fullscreen(ref.current)}>全屏</button></div></div></article>
 }
 
 export default App
